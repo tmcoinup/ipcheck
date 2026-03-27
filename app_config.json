@@ -1,0 +1,5 @@
+{
+  "api_token": "",
+  "token_apply_url": "在这里填写 Token 申请地址，例如你的平台控制台地址",
+  "note": "配置文件说明：api_token 为可选，留空表示不携带 Authorization"
+}

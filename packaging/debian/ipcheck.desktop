@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=IP质量检测工具
+Name[en]=IP Quality Check
+Comment=SOCKS5 代理质量与风控检测
+Exec=ipcheck
+Icon=applications-internet
+Terminal=false
+Type=Application
+Categories=Network;
