@@ -1,6 +1,6 @@
 [package]
 name = "ipcheck"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -17,3 +17,13 @@ futures = "0.3"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[package.metadata.deb]
+name = "ipcheck"
+maintainer = "Your Name panmason@hotmail.com"
+depends = "ca-certificates"
+assets = [
+  { source = "target/release/ipcheck", dest = "usr/bin/ipcheck", mode = "755" },
+  { source = "packaging/debian/ipcheck.desktop", dest = "usr/share/applications/ipcheck.desktop", mode = "644" },
+  { source = "packaging/debian/ipcheck.metainfo.xml", dest = "usr/share/metainfo/ipcheck.metainfo.xml", mode = "644" }
+]

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.hotmail.panmason.ipcheck</id>
+
+  <metadata_license>CC0-1.0</metadata_license>
+
+  <name>IP质量检测工具</name>
+  <name xml:lang="en">IP Quality Check</name>
+  <summary>SOCKS5 代理质量与风控检测</summary>
+
+  <description>
+    <p xml:lang="en">Socks5 proxy quality and risk controls to help you evaluate proxy availability safely before use.</p>
+    <p>用于检测 SOCKS5 代理的质量、稳定性与风控风险，帮助你在使用前更安全地评估代理可用性。</p>
+  </description>
+
+  <launchable type="desktop-id">ipcheck.desktop</launchable>
+  <icon type="stock">applications-internet</icon>
+
+  <categories>
+    <category>Network</category>
+  </categories>
+
+  <releases>
+    <release version="0.1.1" date="2026-03-30"/>
+  </releases>
+</component>
+
