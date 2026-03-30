@@ -55,6 +55,14 @@ pub struct CheckResult {
     pub checked_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealIpHistoryEntry {
+    pub id: i64,
+    pub proxy_id: i64,
+    pub real_ip: String,
+    pub observed_at: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AppStateSnapshot {
     pub token: String,

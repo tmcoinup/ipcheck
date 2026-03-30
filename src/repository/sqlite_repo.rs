@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use rusqlite::{Connection, params};
+use rusqlite::OptionalExtension;
 use thiserror::Error;
 use tracing::{error, info};
 
-use crate::domain::models::{AppStateSnapshot, CheckResult, ProxyEntry, ProxySpec};
+use crate::domain::models::{AppStateSnapshot, CheckResult, ProxyEntry, ProxySpec, RealIpHistoryEntry};
 
 #[derive(Debug, Error)]
 pub enum RepoError {
@@ -19,9 +20,11 @@ pub trait AppRepository: Send + Sync {
     fn load_snapshot(&self) -> Result<AppStateSnapshot, RepoError>;
     fn save_token(&self, token: &str) -> Result<(), RepoError>;
     fn insert_proxies(&self, proxies: &[ProxySpec]) -> Result<(), RepoError>;
+    fn get_proxy_id_by_raw(&self, raw: &str) -> Result<Option<i64>, RepoError>;
     fn update_real_ip(&self, proxy_id: i64, real_ip: &str, checked_at: &str) -> Result<(), RepoError>;
     fn clear_real_ip(&self, proxy_id: i64) -> Result<(), RepoError>;
     fn clear_all_real_ips(&self) -> Result<(), RepoError>;
+    fn get_real_ip_history(&self, proxy_id: i64) -> Result<Vec<RealIpHistoryEntry>, RepoError>;
     fn delete_results_for_proxy(&self, proxy_id: i64) -> Result<(), RepoError>;
     fn insert_result(&self, result: &CheckResult) -> Result<(), RepoError>;
     fn clear_proxies(&self) -> Result<(), RepoError>;
@@ -82,6 +85,13 @@ impl AppRepository for SqliteRepository {
                         base_json TEXT NOT NULL,
                         overall_json TEXT NOT NULL,
                         checked_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS real_ip_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        proxy_id INTEGER NOT NULL,
+                        real_ip TEXT NOT NULL,
+                        observed_at TEXT NOT NULL
                     );
                     "#,
                 )
@@ -205,13 +215,54 @@ impl AppRepository for SqliteRepository {
         Ok(())
     }
 
+    fn get_proxy_id_by_raw(&self, raw: &str) -> Result<Option<i64>, RepoError> {
+        info!(raw = %raw, "repo get_proxy_id_by_raw");
+        let guard = self.conn.lock().map_err(Self::map_err)?;
+        let mut stmt = guard
+            .prepare("SELECT id FROM proxies WHERE raw = ?1 LIMIT 1")
+            .map_err(Self::map_err)?;
+        let mut rows = stmt.query([raw]).map_err(Self::map_err)?;
+        let row_opt = rows.next().map_err(Self::map_err)?;
+        if let Some(row) = row_opt {
+            let id = row.get::<_, i64>(0).map_err(Self::map_err)?;
+            Ok(Some(id))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn update_real_ip(&self, proxy_id: i64, real_ip: &str, checked_at: &str) -> Result<(), RepoError> {
         info!(proxy_id, real_ip, checked_at, "repo update_real_ip");
         let guard = self.conn.lock().map_err(Self::map_err)?;
+
+        let real_ip_trim = real_ip.trim();
+        let last_real_ip: Option<String> = guard
+            .query_row(
+                "SELECT real_ip FROM real_ip_history WHERE proxy_id = ?1 ORDER BY id DESC LIMIT 1",
+                [proxy_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Self::map_err)?;
+
+        let changed = match last_real_ip {
+            Some(prev) => prev.trim() != real_ip_trim,
+            None => true,
+        };
+
+        if changed {
+            guard
+                .execute(
+                    "INSERT INTO real_ip_history(proxy_id, real_ip, observed_at) VALUES (?1, ?2, ?3)",
+                    params![proxy_id, real_ip_trim, checked_at],
+                )
+                .map_err(Self::map_err)?;
+        }
+
         guard
             .execute(
                 "UPDATE proxies SET last_real_ip = ?1, updated_at = ?2 WHERE id = ?3",
-                params![real_ip, checked_at, proxy_id],
+                params![real_ip_trim, checked_at, proxy_id],
             )
             .map_err(Self::map_err)?;
         Ok(())
@@ -239,6 +290,31 @@ impl AppRepository for SqliteRepository {
             )
             .map_err(Self::map_err)?;
         Ok(())
+    }
+
+    fn get_real_ip_history(&self, proxy_id: i64) -> Result<Vec<RealIpHistoryEntry>, RepoError> {
+        info!(proxy_id, "repo get_real_ip_history");
+        let guard = self.conn.lock().map_err(Self::map_err)?;
+        let mut stmt = guard
+            .prepare(
+                "SELECT id, proxy_id, real_ip, observed_at
+                 FROM real_ip_history
+                 WHERE proxy_id = ?1
+                 ORDER BY id DESC
+                 LIMIT 200",
+            )
+            .map_err(Self::map_err)?;
+        let rows = stmt
+            .query_map([proxy_id], |row| {
+                Ok(RealIpHistoryEntry {
+                    id: row.get(0)?,
+                    proxy_id: row.get(1)?,
+                    real_ip: row.get(2)?,
+                    observed_at: row.get(3)?,
+                })
+            })
+            .map_err(Self::map_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Self::map_err)
     }
 
     fn delete_results_for_proxy(&self, proxy_id: i64) -> Result<(), RepoError> {
@@ -292,6 +368,9 @@ impl AppRepository for SqliteRepository {
         guard
             .execute("DELETE FROM proxies", [])
             .map_err(Self::map_err)?;
+        guard
+            .execute("DELETE FROM real_ip_history", [])
+            .map_err(Self::map_err)?;
         Ok(())
     }
 
@@ -303,6 +382,9 @@ impl AppRepository for SqliteRepository {
             .map_err(Self::map_err)?;
         guard
             .execute("DELETE FROM proxies WHERE id = ?1", [proxy_id])
+            .map_err(Self::map_err)?;
+        guard
+            .execute("DELETE FROM real_ip_history WHERE proxy_id = ?1", [proxy_id])
             .map_err(Self::map_err)?;
         Ok(())
     }

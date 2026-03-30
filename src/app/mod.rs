@@ -6,11 +6,12 @@ use iced::widget::{
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::{Application, Border, Color, Command, Element, Length, Subscription, Theme, executor, window};
 use std::process::{Command as ProcCommand, Stdio};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tracing::info;
 
 use crate::config::app_config::load_or_init_config;
-use crate::domain::models::{CheckResult, ProxyEntry};
+use crate::domain::models::{CheckResult, ProxyEntry, RealIpHistoryEntry};
 use crate::repository::sqlite_repo::{AppRepository, SqliteRepository};
 use crate::service::ip_service::{CheckProxyBatchOutcome, IpCheckService, resolve_db_path};
 
@@ -50,7 +51,7 @@ fn table_h_scroll_id_row(idx: usize) -> scrollable::Id {
 }
 
 /// zenity 导入窗口顶部说明（类似 placeholder 提示）
-const IMPORT_DIALOG_HINT: &str = "在下方编辑区粘贴或输入代理；支持格式示例：\n• socks5://username:password@host:port\n• host|port|username|password\n• socks5://host:port---username---password\n\n编辑完成后点「确定」导入。";
+const IMPORT_DIALOG_HINT: &str = "在下方编辑区粘贴或输入代理；支持格式示例：\n• socks5://username:password@host:port\n• host|port|username|password\n• socks5://host:port---username---password\n• ip:port username password\n\n编辑完成后点「确定」导入。";
 
 fn is_risk_rate_limit_msg(s: &str) -> bool {
     s.contains("风控接口限速")
@@ -105,6 +106,9 @@ pub struct IpCheckApp {
     draft_single_result: Option<CheckResult>,
     proxies: Vec<ProxyEntry>,
     results: Vec<CheckResult>,
+    real_ip_histories: HashMap<i64, Vec<RealIpHistoryEntry>>,
+    expanded_real_ip_history: HashSet<i64>,
+    loading_real_ip_history: HashSet<i64>,
     busy: bool,
     toast: Option<Toast>,
     toast_seq: u64,
@@ -127,11 +131,16 @@ pub enum Message {
     OpenSingleCheckModal,
     CloseSingleCheckModal,
     SingleCheckContentAction(text_editor::Action),
+    /// 兜底：`iced 0.12` 下 `text_editor` 可能无法正确绑定 `Ctrl+A`，
+    /// 这里在应用层捕获键盘事件后强制全选。
+    SingleCheckCtrlASelectAll,
     Imported(Result<Vec<ProxyEntry>, String>),
     QueryAllRealIp,
     RealIpDone(Result<Vec<(i64, String, String)>, String>),
     QueryOneRealIp(i64),
     QueryOneRealIpDone(Result<(i64, String, String), (i64, String)>),
+    ToggleRealIpHistory(i64),
+    RealIpHistoryDone(Result<(i64, Vec<RealIpHistoryEntry>), (i64, String)>),
     RiskCheckOne(i64),
     RiskCheckOneDone(Result<CheckResult, String>),
     CheckAll,
@@ -201,6 +210,9 @@ impl Application for IpCheckApp {
             draft_single_result: None,
             proxies: Vec::new(),
             results: Vec::new(),
+            real_ip_histories: HashMap::new(),
+            expanded_real_ip_history: HashSet::new(),
+            loading_real_ip_history: HashSet::new(),
             busy: false,
             toast: None,
             toast_seq: 0,
@@ -244,6 +256,20 @@ impl Application for IpCheckApp {
     fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
         info!(?message, "app received message");
         match message {
+            Message::SingleCheckCtrlASelectAll => {
+                if self.show_single_check_modal {
+                    // iced 0.12 的 `Action` 不包含 `SelectAll`，用文档起止 motion 拼一个“全选”。
+                    self.single_check_content
+                        .perform(text_editor::Action::Move(
+                            text_editor::Motion::DocumentStart,
+                        ));
+                    self.single_check_content
+                        .perform(text_editor::Action::Select(
+                            text_editor::Motion::DocumentEnd,
+                        ));
+                }
+                Command::none()
+            }
             Message::TableHorizontalScroll { offset_x, source } => {
                 if (offset_x - self.table_h_scroll_x).abs() < TABLE_H_SCROLL_EPS {
                     return Command::none();
@@ -395,12 +421,84 @@ impl Application for IpCheckApp {
                             if let Some(proxy) = self.proxies.iter_mut().find(|p| p.id == id) {
                                 proxy.last_real_ip = Some(ip);
                                 proxy.updated_at = Some(updated_at);
+
+                                // 若用户已展开历史：仅在 IP 发生变化时追加到内存中，避免重复。
+                                if self.expanded_real_ip_history.contains(&id) {
+                                    let hist = self
+                                        .real_ip_histories
+                                        .entry(id)
+                                        .or_insert_with(Vec::new);
+                                    let ip_trim = proxy
+                                        .last_real_ip
+                                        .as_deref()
+                                        .unwrap_or_default()
+                                        .trim()
+                                        .to_string();
+                                    let last_ip_same = hist
+                                        .last()
+                                        .map(|x| x.real_ip.trim() == ip_trim)
+                                        .unwrap_or(false);
+                                    if !last_ip_same {
+                                        hist.push(RealIpHistoryEntry {
+                                            id: 0,
+                                            proxy_id: id,
+                                            real_ip: ip_trim,
+                                            observed_at: proxy
+                                                .updated_at
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                        });
+                                    }
+                                }
                             }
                         }
                         self.show_toast("查询IP完成")
                     }
                     Err(err) => self.show_toast(&format!("查询IP失败: {err}")),
                 }
+            }
+            Message::ToggleRealIpHistory(proxy_id) => {
+                if self.expanded_real_ip_history.contains(&proxy_id) {
+                    self.expanded_real_ip_history.remove(&proxy_id);
+                    return Command::none();
+                }
+                self.expanded_real_ip_history.insert(proxy_id);
+
+                if self.real_ip_histories.contains_key(&proxy_id) || self.loading_real_ip_history.contains(&proxy_id) {
+                    return Command::none();
+                }
+
+                let Some(service) = self.service.clone() else {
+                    return self.show_toast("服务不可用");
+                };
+                self.loading_real_ip_history.insert(proxy_id);
+
+                Command::perform(
+                    async move {
+                        let history = service
+                            .get_real_ip_history(proxy_id)
+                            .map_err(|e| (proxy_id, e.to_string()))?;
+                        Ok::<(i64, Vec<RealIpHistoryEntry>), (i64, String)>((proxy_id, history))
+                    },
+                    |res| match res {
+                        Ok(ok) => Message::RealIpHistoryDone(Ok(ok)),
+                        Err((id, err)) => Message::RealIpHistoryDone(Err((id, err))),
+                    },
+                )
+            }
+            Message::RealIpHistoryDone(result) => {
+                match result {
+                    Ok((id, history)) => {
+                        self.loading_real_ip_history.remove(&id);
+                        self.real_ip_histories.insert(id, history);
+                    }
+                    Err((id, err)) => {
+                        self.loading_real_ip_history.remove(&id);
+                        let _ = self.show_toast(&format!("加载真实IP历史失败: {err}"));
+                    }
+                }
+                Command::none()
             }
             Message::QueryOneRealIp(id) => {
                 let Some(service) = self.service.clone() else {
@@ -483,6 +581,26 @@ impl Application for IpCheckApp {
                         if let Some(p) = self.proxies.iter_mut().find(|p| p.id == item.proxy_id) {
                             p.last_real_ip = Some(item.real_ip.clone());
                             p.updated_at = Some(item.checked_at.clone());
+
+                            if self.expanded_real_ip_history.contains(&item.proxy_id) {
+                                let hist = self
+                                    .real_ip_histories
+                                    .entry(item.proxy_id)
+                                    .or_insert_with(Vec::new);
+                                let ip_trim = item.real_ip.trim().to_string();
+                                let last_ip_same = hist
+                                    .last()
+                                    .map(|x| x.real_ip.trim() == ip_trim)
+                                    .unwrap_or(false);
+                                if !last_ip_same {
+                                    hist.push(RealIpHistoryEntry {
+                                        id: 0,
+                                        proxy_id: item.proxy_id,
+                                        real_ip: ip_trim,
+                                        observed_at: item.checked_at.clone(),
+                                    });
+                                }
+                            }
                         }
                         self.results.retain(|r| r.proxy_id != item.proxy_id);
                         self.results.insert(0, item);
@@ -576,6 +694,26 @@ impl Application for IpCheckApp {
                             if let Some(p) = self.proxies.iter_mut().find(|p| p.id == item.proxy_id) {
                                 p.last_real_ip = Some(item.real_ip.clone());
                                 p.updated_at = Some(item.checked_at.clone());
+
+                                if self.expanded_real_ip_history.contains(&item.proxy_id) {
+                                    let hist = self
+                                        .real_ip_histories
+                                        .entry(item.proxy_id)
+                                        .or_insert_with(Vec::new);
+                                    let ip_trim = item.real_ip.trim().to_string();
+                                    let last_ip_same = hist
+                                        .last()
+                                        .map(|x| x.real_ip.trim() == ip_trim)
+                                        .unwrap_or(false);
+                                    if !last_ip_same {
+                                        hist.push(RealIpHistoryEntry {
+                                            id: 0,
+                                            proxy_id: item.proxy_id,
+                                            real_ip: ip_trim,
+                                            observed_at: item.checked_at.clone(),
+                                        });
+                                    }
+                                }
                             }
                             self.results.insert(0, item);
                         }
@@ -617,6 +755,8 @@ impl Application for IpCheckApp {
                 match result {
                     Ok(()) => {
                         if let Some(item) = self.draft_single_result.clone() {
+                            // 保持与批量/单条风控一致：先移除同一 proxy_id 的旧结果再插入新结果。
+                            self.results.retain(|r| r.proxy_id != item.proxy_id);
                             self.results.insert(0, item);
                         }
                         self.show_single_result_modal = false;
@@ -910,6 +1050,16 @@ impl Application for IpCheckApp {
                     Message::DeleteOne(proxy.id)
                 };
 
+                let history_toggle_msg = if busy {
+                    Message::Noop
+                } else {
+                    Message::ToggleRealIpHistory(proxy.id)
+                };
+
+                let real_ip_history_expanded = self.expanded_real_ip_history.contains(&proxy.id);
+                let real_ip_history_loading = self.loading_real_ip_history.contains(&proxy.id);
+                let real_ip_history_opt = self.real_ip_histories.get(&proxy.id);
+
                 let op_row = row![
                     button(
                         row![
@@ -967,10 +1117,14 @@ impl Application for IpCheckApp {
                         table_cell_data(proxy.password.clone(), 1, risk_clean_row),
                         table_cell_data("socks5".to_string(), 1, risk_clean_row),
                         table_cell_data(created_at, 2, risk_clean_row),
-                        table_cell_ip_colored(
+                        table_cell_real_ip_history(
                             real_ip_display,
                             2,
                             ip_cell_display_for_real(result, ip_risk, pseudo_real_ip),
+                            history_toggle_msg,
+                            real_ip_history_expanded,
+                            real_ip_history_loading,
+                            real_ip_history_opt,
                         ),
                         table_cell_data(location, 2, risk_clean_row),
                         table_cell_data(isp, 1, risk_clean_row),
@@ -999,10 +1153,14 @@ impl Application for IpCheckApp {
                         table_cell_data(proxy.password.clone(), 1, risk_clean_row),
                         table_cell_data("socks5".to_string(), 1, risk_clean_row),
                         table_cell_data(created_at, 2, risk_clean_row),
-                        table_cell_ip_colored(
+                        table_cell_real_ip_history(
                             real_ip_display,
                             2,
                             ip_cell_display_for_real(result, ip_risk, pseudo_real_ip),
+                            history_toggle_msg,
+                            real_ip_history_expanded,
+                            real_ip_history_loading,
+                            real_ip_history_opt,
                         ),
                         table_cell_data(location, 2, risk_clean_row),
                         table_cell_data(isp, 1, risk_clean_row),
@@ -1207,7 +1365,7 @@ impl IpCheckApp {
             column![
                 text("风控检查单个节点").size(24),
                 text("输入 1 条节点信息").size(14),
-                text("格式提示（任选一种）：socks5://user:pass@host:port ｜ host|port|user|pass ｜ socks5://host:port---user---pass")
+                text("格式提示（任选一种）：socks5://user:pass@host:port ｜ host|port|user|pass ｜ socks5://host:port---user---pass ｜ ip:port user pass")
                     .size(12)
                     .style(theme::Text::Color(iced::Color::from_rgb8(100, 110, 130))),
                 text_editor(&self.single_check_content)
@@ -1340,6 +1498,102 @@ fn table_cell_ip_colored(
     .width(Length::FillPortion(portion))
     .padding(6)
     .into()
+}
+
+fn table_cell_real_ip_history(
+    label: String,
+    portion: u16,
+    display: IpCellDisplay,
+    toggle_msg: Message,
+    expanded: bool,
+    loading: bool,
+    history_opt: Option<&Vec<RealIpHistoryEntry>>,
+) -> Element<'static, Message> {
+    let label_trim = label.trim().to_string();
+    let t = text(label.clone()).size(14);
+    let t = match display {
+        IpCellDisplay::RiskRed => t.style(theme::Text::Color(Color::from_rgb8(198, 40, 40))),
+        IpCellDisplay::CleanGreen => t.style(theme::Text::Color(Color::from_rgb8(22, 163, 74))),
+        IpCellDisplay::PseudoGray => t.style(theme::Text::Color(Color::from_rgb8(130, 130, 135))),
+        IpCellDisplay::Default => t,
+    };
+
+    let top = row![
+        mouse_area(
+            container(t)
+                .width(Length::Fill)
+                .padding(6),
+        )
+        .on_press(Message::CopyCellToClipboard(label.clone())),
+        button(if expanded { "收起" } else { "历史" })
+            .style(theme::Button::Secondary)
+            .padding([2, 6])
+            .on_press(toggle_msg),
+    ]
+    .spacing(6)
+    .align_items(iced::Alignment::Center);
+
+    let history_box: Element<'static, Message> = if expanded {
+        if loading {
+            container(text("加载中...").size(12))
+                .padding([0, 6, 0, 6])
+                .style(theme::Container::Box)
+                .into()
+        } else if let Some(hist) = history_opt {
+            if hist.is_empty() {
+                container(text("暂无历史记录").size(12))
+                    .padding([0, 6, 0, 6])
+                    .style(theme::Container::Box)
+                    .into()
+            } else {
+                let max_lines = 8usize;
+                let mut lines: Vec<Element<'static, Message>> = Vec::new();
+                for entry in hist.iter().take(max_lines) {
+                    let is_current = entry.real_ip.trim() == label_trim;
+                    let line_t = text(format!(
+                        "{}  {}",
+                        entry.real_ip.trim(),
+                        entry.observed_at.trim()
+                    ))
+                    .size(12);
+                    let line_t = if is_current {
+                        line_t.style(theme::Text::Color(Color::from_rgb8(59, 130, 246)))
+                    } else {
+                        line_t
+                    };
+                    let entry_copy = entry.real_ip.clone();
+                    let line_el = container(mouse_area(container(line_t).padding(4)).on_press(
+                        Message::CopyCellToClipboard(entry_copy),
+                    ));
+                    lines.push(line_el.into());
+                }
+                if hist.len() > max_lines {
+                    lines.push(
+                        container(text("...").size(12))
+                            .padding([4, 6])
+                            .into(),
+                    );
+                }
+
+                container(column(lines).spacing(4).align_items(iced::Alignment::Start))
+                    .padding([0, 6, 0, 6])
+                    .style(theme::Container::Box)
+                    .into()
+            }
+        } else {
+            container(text("暂无历史记录").size(12))
+                .padding([0, 6, 0, 6])
+                .style(theme::Container::Box)
+                .into()
+        }
+    } else {
+        container(text("")).height(Length::Shrink).into()
+    };
+
+    container(column![top, history_box].spacing(4).align_items(iced::Alignment::Center))
+        .width(Length::FillPortion(portion))
+        .padding(6)
+        .into()
 }
 
 /// 普通单元格；`row_green` 为真时表示该行风控已检且无异常，用绿色字。
@@ -1495,10 +1749,24 @@ fn window_event_to_viewport_message(
     event: iced::Event,
     status: iced::event::Status,
 ) -> Option<Message> {
-    if matches!(status, iced::event::Status::Captured) {
-        return None;
-    }
     match event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            let ctrl = modifiers.contains(iced::keyboard::Modifiers::CTRL);
+            let key_is_a = match key {
+                iced::keyboard::Key::Character(c) => c.eq_ignore_ascii_case("a"),
+                _ => false,
+            };
+
+            // 即使事件已被控件捕获，也希望能修复 iced 0.12 的 `Ctrl+A` 全选失效。
+            if ctrl && key_is_a {
+                return Some(Message::SingleCheckCtrlASelectAll);
+            }
+            if matches!(status, iced::event::Status::Captured) {
+                None
+            } else {
+                None
+            }
+        }
         iced::Event::Window(_, iced::window::Event::Opened { size, .. }) => {
             Some(Message::WindowOpened {
                 width: size.width as f32,

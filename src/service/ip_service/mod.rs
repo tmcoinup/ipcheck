@@ -21,7 +21,7 @@ pub struct CheckProxyBatchOutcome {
     pub skipped_rate_limit: u32,
 }
 
-use crate::domain::models::{CheckResult, ProxyEntry, ProxySpec};
+use crate::domain::models::{CheckResult, ProxyEntry, ProxySpec, RealIpHistoryEntry};
 use crate::repository::sqlite_repo::AppRepository;
 
 use baidu_api::{query_base, query_overall};
@@ -52,7 +52,8 @@ impl<R: AppRepository + Clone + 'static> IpCheckService<R> {
         }
         if parsed.is_empty() {
             return Err(ServiceError::InvalidProxy(
-                "未解析到有效代理行（可与说明混贴；仅识别 socks5 / 管道 / --- 格式）".to_string(),
+                "未解析到有效代理行（可与说明混贴；支持 socks5 / 管道 / --- / `ip:port username password` 格式）"
+                    .to_string(),
             ));
         }
         info!(count = parsed.len(), "service parse_import_text done");
@@ -189,6 +190,12 @@ impl<R: AppRepository + Clone + 'static> IpCheckService<R> {
             .map_err(|e| ServiceError::Repo(e.to_string()))
     }
 
+    pub fn get_real_ip_history(&self, proxy_id: i64) -> Result<Vec<RealIpHistoryEntry>, ServiceError> {
+        self.repo
+            .get_real_ip_history(proxy_id)
+            .map_err(|e| ServiceError::Repo(e.to_string()))
+    }
+
     pub fn delete_results_for_proxy(&self, proxy_id: i64) -> Result<(), ServiceError> {
         self.repo
             .delete_results_for_proxy(proxy_id)
@@ -203,21 +210,40 @@ impl<R: AppRepository + Clone + 'static> IpCheckService<R> {
         let proxy = ProxyEntry {
             id: 0,
             raw: spec.raw.clone(),
-            username: spec.username,
-            password: spec.password,
-            host: spec.host,
+            username: spec.username.clone(),
+            password: spec.password.clone(),
+            host: spec.host.clone(),
             port: spec.port,
             created_at: None,
             last_real_ip: None,
             updated_at: None,
         };
+
+        // 把“单个检测”关联到现有代理行（或自动创建一行），确保保存结果后主表可展示。
+        self.repo
+            .insert_proxies(&[spec.clone()])
+            .map_err(|e| ServiceError::Repo(e.to_string()))?;
+        let proxy_id = self
+            .repo
+            .get_proxy_id_by_raw(&spec.raw)
+            .map_err(|e| ServiceError::Repo(e.to_string()))?
+            .ok_or_else(|| {
+                ServiceError::Repo("failed to resolve proxy id after insert".to_string())
+            })?;
+
         let client = build_proxy_client(&proxy, token.as_str())?;
         let real_ip = query_real_ip_or_pseudo(&client, &proxy).await;
         let base = query_base(&client, &real_ip).await?;
         let overall = query_overall(&client, &real_ip).await?;
         let checked_at = now_string();
+
+        // 同步更新代理行的最后一次真实出口 IP 与更新时间（与批量逻辑保持一致）。
+        self.repo
+            .update_real_ip(proxy_id, &real_ip, &checked_at)
+            .map_err(|e| ServiceError::Repo(e.to_string()))?;
+
         Ok(CheckResult {
-            proxy_id: 0,
+            proxy_id,
             source_proxy: spec.raw,
             real_ip,
             base,
