@@ -22,7 +22,7 @@ fn main() -> iced::Result {
     tracing::info!(font = font_name, "selected ui font");
 
     // 初始尺寸仅为创建窗口用；启动完成后最大化在 app 内仅调用一次（首次 Loaded，或无库时首次 WindowOpened）。
-    let window_settings = window::Settings {
+    let mut window_settings = window::Settings {
         size: iced::Size::new(1920.0, 1080.0),
         position: window::Position::Centered,
         min_size: Some(iced::Size::new(1024.0, 768.0)),
@@ -31,8 +31,15 @@ fn main() -> iced::Result {
         transparent: false,
         ..window::Settings::default()
     };
+    #[cfg(target_os = "linux")]
+    {
+        // Linux(GNOME/KDE) 的 Dock 绑定优先使用 WM_CLASS / app_id；
+        // 必须与 desktop 文件名 `ipcheck.desktop` 的 basename 一致，才能合并为同一图标。
+        window_settings.platform_specific.application_id = "ipcheck".to_string();
+    }
 
     IpCheckApp::run(Settings {
+        id: Some("ipcheck".to_string()),
         window: window_settings,
         antialiasing: true,
         default_font: Font::with_name(font_name),

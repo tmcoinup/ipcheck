@@ -187,6 +187,7 @@ fn first_startup_maximize_once(app: &mut IpCheckApp) -> Command<Message> {
 
 #[derive(Debug, Clone)]
 pub struct LoadedData {
+    token: String,
     proxies: Vec<ProxyEntry>,
     results: Vec<CheckResult>,
 }
@@ -229,13 +230,20 @@ impl Application for IpCheckApp {
         }
 
         let service = app.service.clone();
+        let config_token = app.api_token.clone();
         let cmd = Command::perform(
             async move {
                 let Some(service) = service else {
                     return Err::<LoadedData, String>("service unavailable".to_string());
                 };
+                if !config_token.trim().is_empty() {
+                    service
+                        .save_token(config_token.as_str())
+                        .map_err(|e| e.to_string())?;
+                }
                 let snapshot = service.load_snapshot().map_err(|e| e.to_string())?;
                 Ok::<LoadedData, String>(LoadedData {
+                    token: snapshot.token,
                     proxies: snapshot.proxies,
                     results: snapshot.results,
                 })
@@ -306,6 +314,9 @@ impl Application for IpCheckApp {
             Message::Loaded(result) => {
                 let toast_cmd = match result {
                     Ok(data) => {
+                        if self.api_token.trim().is_empty() && !data.token.trim().is_empty() {
+                            self.api_token = data.token;
+                        }
                         self.proxies = data.proxies;
                         self.results = data.results;
                         self.show_toast("已加载本地数据")

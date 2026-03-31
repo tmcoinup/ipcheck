@@ -80,6 +80,11 @@ RUST_LOG=debug cargo run
 | 通用 Linux 二进制包 | `./scripts/package-linux-tarball.sh` | `tar.gz` + README |
 | Windows | `./scripts/package-windows-zip.sh` | 需在 **Windows** 上 `cargo build --release` 或安装 `x86_64-pc-windows-gnu` 交叉编译链 |
 
+Linux 桌面环境（GNOME/KDE）注意事项：
+
+- `.desktop` 需与窗口应用标识一致：`StartupWMClass=ipcheck`，且 Linux 下窗口 `application_id` 为 `ipcheck`（对应 `ipcheck.desktop` basename），否则可能出现“启动器图标 + 运行窗口图标”分离。
+- 若任务栏有“启动中转圈”残留，可在 `.desktop` 使用 `StartupNotify=false` 并通过 `Exec=env DESKTOP_STARTUP_ID= ipcheck` 禁用启动通知跟踪。
+
 详细步骤与依赖见各脚本内注释。若交叉编译 Windows，通常需要：
 
 ```bash
