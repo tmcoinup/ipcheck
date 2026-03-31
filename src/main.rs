@@ -5,7 +5,7 @@ mod repository;
 mod service;
 
 use app::IpCheckApp;
-use iced::{Application, Font, Settings, window};
+use iced::{Font, Settings, window};
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
 
@@ -38,14 +38,19 @@ fn main() -> iced::Result {
         window_settings.platform_specific.application_id = "ipcheck".to_string();
     }
 
-    IpCheckApp::run(Settings {
-        id: Some("ipcheck".to_string()),
-        window: window_settings,
-        antialiasing: true,
-        default_font: Font::with_name(font_name),
-        default_text_size: iced::Pixels(14.0),
-        ..Settings::default()
-    })
+    iced::application(IpCheckApp::init, IpCheckApp::update, IpCheckApp::view)
+        .subscription(IpCheckApp::subscription)
+        .theme(IpCheckApp::theme)
+        .title(IpCheckApp::title)
+        .window(window_settings)
+        .settings(Settings {
+            id: Some("ipcheck".to_string()),
+            antialiasing: true,
+            default_font: Font::with_name(font_name),
+            default_text_size: iced::Pixels(14.0),
+            ..Settings::default()
+        })
+        .run()
 }
 
 fn pick_font_family() -> &'static str {
